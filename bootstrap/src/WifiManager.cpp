@@ -1,0 +1,960 @@
+/*
+  WifiManager.cpp - Managing WiFi and OTA
+
+  Copyright (C) 2020 - 2022  Davide Perini
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  You should have received a copy of the MIT License along with this program.
+  If not, see <https://opensource.org/licenses/MIT/>.
+*/
+
+#include "WifiManager.h"
+
+//Establishing Local server at port 80 whenever required
+#if defined(ESP8266)
+ESP8266WebServer server(80);
+#elif defined(ESP32)
+WebServer server(80);
+#endif
+// WiFiClient
+WiFiClient espClient;
+// WebServer content
+String content;
+// WebServer status code
+int statusCode;
+// WebServer HTML frontend
+String htmlString;
+byte improvActive; //0: no improv packet received, 1: improv active, 2: provisioning
+byte improvError;
+char serverDescription[33] = "ratgdo";
+char cmDNS[33] = "x";
+char clientSSID[33];
+char clientPass[65];
+unsigned long previousMillisEsp32Reconnect = 0;
+unsigned long intervalEsp32Reconnect = 15000;
+
+/********************************** SETUP WIFI *****************************************/
+void WifiManager::setupWiFi(void (*manageDisconnections)(), void (*manageHardwareButton)()) {
+
+  wifiReconnectAttemp = 0;
+
+  // DPsoftware domotics
+#if (DISPLAY_ENABLED)
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(5,17);
+  display.drawRoundRect(0, 0, display.width()-1, display.height()-1, display.height()/4, WHITE);
+#endif
+  helper.smartPrintln(F("DPsoftware domotics"));
+  helper.smartDisplay(DELAY_3000);
+
+#if (DISPLAY_ENABLED)
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);
+#endif
+  helper.smartPrintln(F("Connecting to: "));
+  helper.smartPrint(qsid);
+  helper.smartPrintln(F("..."));
+  helper.smartDisplay(DELAY_2000);
+
+  WiFi.persistent(true);   // Solve possible wifi init errors (re-add at 6.2.1.16 #4044, #4083)
+  WiFi.disconnect(true);    // Delete SDK wifi config
+  delay(DELAY_200);
+  WiFi.mode(WIFI_STA);      // Disable AP mode
+#if defined(ESP8266)
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+  WiFi.setAutoConnect(true);
+  WiFi.setAutoReconnect(true);
+  if (!microcontrollerIP.equals("DHCP")) {
+    WiFi.config(IPAddress(helper.getValue(microcontrollerIP, '.', 0).toInt(),
+                          helper.getValue(microcontrollerIP, '.', 1).toInt(),
+                          helper.getValue(microcontrollerIP, '.', 2).toInt(),
+                          helper.getValue(microcontrollerIP, '.', 3).toInt()),
+                IPAddress(helper.getValue(IP_GATEWAY, '.', 0).toInt(),
+                          helper.getValue(IP_GATEWAY, '.', 1).toInt(),
+                          helper.getValue(IP_GATEWAY, '.', 2).toInt(),
+                          helper.getValue(IP_GATEWAY, '.', 3).toInt()),
+                IPAddress(helper.getValue(IP_SUBNET, '.', 0).toInt(),
+                          helper.getValue(IP_SUBNET, '.', 1).toInt(),
+                          helper.getValue(IP_SUBNET, '.', 2).toInt(),
+                          helper.getValue(IP_SUBNET, '.', 3).toInt()),
+                IPAddress(helper.getValue(IP_DNS, '.', 0).toInt(),
+                          helper.getValue(IP_DNS, '.', 1).toInt(),
+                          helper.getValue(IP_DNS, '.', 2).toInt(),
+                          helper.getValue(IP_DNS, '.', 3).toInt()));
+    Serial.println(F("Using static IP address"));
+    dhcpInUse = false;
+  } else {
+    Serial.println(F("Using DHCP"));
+    dhcpInUse = true;
+  }
+#if defined(ESP8266)
+  WiFi.hostname(helper.string2char(deviceName));
+  // Set wifi power in dbm range 0/0.25, set to 0 to reduce PIR false positive due to wifi power, 0 low, 20.5 max.
+  WiFi.setOutputPower(WIFI_POWER);
+  Serial.print("Set WiFi output power to: ");
+  Serial.println(WIFI_POWER);
+  if (microcontrollerIP.equals("DHCP")) {
+    WiFi.config(0U, 0U, 0U);
+  }
+  WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &event) {
+      Serial.println(F("WiFi connection is lost."));
+      WiFi.reconnect();
+  });
+
+
+#elif defined(ESP32)
+  WiFi.setHostname(helper.string2char(deviceName));
+  btStop();
+#endif
+  // Start wifi connection
+  WiFi.begin(qsid.c_str(), qpass.c_str());
+#if defined(ESP32)
+  WiFi.setSleep(false);
+#endif
+
+  reconnectToWiFi(manageDisconnections, manageHardwareButton);
+  MAC = WiFi.macAddress();
+
+  delay(DELAY_1500);
+
+  // reset the lastWIFiConnection to off, will be initialized by next time update
+  lastWIFiConnection = OFF_CMD;
+
+}
+
+void WifiManager::reconnectToWiFi(void (*manageDisconnections)(), void (*manageHardwareButton)()) {
+
+  wifiReconnectAttemp = 0;
+
+  // loop here until connection
+  while (WiFi.status() != WL_CONNECTED) {
+
+    manageHardwareButton();
+    delay(DELAY_500);
+    Serial.print(F("."));
+    wifiReconnectAttemp++;
+    if (wifiReconnectAttemp > 10) {
+      // if fastDisconnectionManagement we need to execute the callback immediately,
+      // example: power off a watering system can't wait MAX_RECONNECT attemps
+      if (fastDisconnectionManagement) {
+        manageDisconnections();
+      }
+#if (DISPLAY_ENABLED)
+      display.setCursor(0,0);
+      display.clearDisplay();
+      display.setTextSize(1);
+#endif
+      helper.smartPrint(F("Wifi attemps= "));
+      helper.smartPrintln(wifiReconnectAttemp);
+#if defined(ESP32)
+      // Arduino 2.x for ESP32 seems to not support callback, polling to reconnect.
+      unsigned long currentMillisEsp32Reconnect = millis();
+      if (currentMillisEsp32Reconnect - previousMillisEsp32Reconnect >= intervalEsp32Reconnect) {
+        WiFi.disconnect();
+        WiFi.begin(qsid.c_str(), qpass.c_str());
+        previousMillisEsp32Reconnect = currentMillisEsp32Reconnect;
+      }
+#endif
+      if (wifiReconnectAttemp >= MAX_RECONNECT) {
+        helper.smartPrintln(F("Max retry reached, powering off peripherals."));
+        manageDisconnections();
+      }
+      helper.smartDisplay();
+    } else if (wifiReconnectAttemp > 10000) {
+      wifiReconnectAttemp = 0;
+    }
+
+  }
+  if (wifiReconnectAttemp > 0) {
+    helper.smartPrint(F("\nWIFI CONNECTED\nIP Address: "));
+    microcontrollerIP = WiFi.localIP().toString();
+    helper.smartPrintln(microcontrollerIP);
+    helper.smartPrint(F("nb of attempts: "));
+    helper.smartPrintln(wifiReconnectAttemp);
+  }
+
+}
+
+/********************************** SETUP OTA *****************************************/
+void WifiManager::setupOTAUpload() {
+  if(disableOTA){
+    Serial.println("OTA Disabled in setup.json; Skipping Arduino OTA setup");
+    return;
+  }
+
+  Serial.println("Starting ArduinoOTA service");
+
+  //OTA SETUP
+  ArduinoOTA.setPort(OTA_PORT);
+  // Hostname defaults to esp8266-[ChipID]
+  ArduinoOTA.setHostname(helper.string2char(deviceName));
+
+  // No authentication by default
+  ArduinoOTA.setPassword((const char *) helper.string2char(OTApass));
+
+  ArduinoOTA.onStart([]() {
+      Serial.println(F("Starting"));
+  });
+
+  ArduinoOTA.onEnd([]() {
+      Serial.println(F("End"));
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println(F("Auth Failed"));
+      else if (error == OTA_BEGIN_ERROR) Serial.println(F("Begin Failed"));
+      else if (error == OTA_CONNECT_ERROR) Serial.println(F("Connect Failed"));
+      else if (error == OTA_RECEIVE_ERROR) Serial.println(F("Receive Failed"));
+      else if (error == OTA_END_ERROR) Serial.println(F("End Failed"));
+  });
+
+  ArduinoOTA.begin();
+
+}
+
+/*
+   Return the quality (Received Signal Strength Indicator) of the WiFi network.
+   Returns a number between 0 and 100 if WiFi is connected.
+   Returns -1 if WiFi is disconnected.
+*/
+int WifiManager::getQuality() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return -1;
+  }
+  int dBm = WiFi.RSSI();
+  if (dBm <= -100) {
+    return 0;
+  }
+  if (dBm >= -50) {
+    return 100;
+  }
+  return 2 * (dBm + 100);
+}
+
+// check if wifi is correctly configured
+bool WifiManager::isWifiConfigured() {
+
+  if (strcmp(SSID, "XXX") != 0) {
+    return true;
+  }
+  return false;
+
+}
+
+// if no ssid available, launch web server to get config params via browser
+void WifiManager::launchWebServerForOTAConfig() {
+
+  WiFi.disconnect();
+  Serial.println("Turning HotSpot On");
+
+  setupAP();
+  launchWeb();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(10);
+    server.handleClient();
+  }
+
+}
+
+// Manage improv wifi
+void WifiManager::manageImprovWifi() {
+
+  handleImprovPacket();
+
+}
+
+void WifiManager::launchWeb() {
+
+  Serial.println("");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+  }
+  Serial.print("Local IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("SoftAP IP: ");
+  Serial.println(WiFi.softAPIP());
+  createWebServer();
+  server.begin();
+  Serial.println("Server started");
+
+}
+
+void WifiManager::setupAP(void) {
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(DELAY_200);
+  int n = WiFi.scanNetworks();
+  Serial.println("scan done");
+  if (n == 0) {
+    Serial.println("no networks found");
+  } else {
+    Serial.print(n);
+    Serial.println(" networks found");
+    for (int i = 0; i < n; ++i) {
+      // Print SSID and RSSI for each network found
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(")");
+#if defined(ESP8266)
+      Serial.println((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? " " : "*");
+#elif defined(ESP32)
+      Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " " : "*");
+#endif
+      delay(10);
+    }
+  }
+  Serial.println("");
+  htmlString = "<table id='wifi'><tr><th>SSID</th><th>RSSI</th><th>Enctipted</th></tr>";
+  for (int i = 0; i < n; ++i) {
+    htmlString += "<tr>";
+    htmlString += "<td>";
+    htmlString += WiFi.SSID(i);
+    htmlString += "</td>";
+    htmlString += "<td>";
+    htmlString += WiFi.RSSI(i);
+    htmlString += "</td>";
+    htmlString += "<td>";
+#if defined(ESP8266)
+    htmlString += ((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "PUBLIC" : "ENCRYPTED");
+#elif defined(ESP32)
+    htmlString += ((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "PUBLIC" : "ENCRYPTED");
+#endif
+    htmlString += "</td>";
+    htmlString += "</tr>";
+  }
+  htmlString += "</table>";
+  delay(100);
+  WiFi.softAP(WIFI_DEVICE_NAME, "");
+  launchWeb();
+
+}
+
+void WifiManager::createWebServer() {
+
+  ///////////////////////////////////////////////////////
+  // Setup page
+  server.on("/", []() {
+    if(strcmp(OTApass.c_str(), "XXX") != 0 && strcmp(OTApass.c_str(),"") != 0 && !server.authenticate(deviceName.c_str(),OTApass.c_str())){
+      Serial.println("Request Basic Authentication");
+      Serial.print("pass: ");
+      Serial.println(OTApass.c_str());
+      return server.requestAuthentication(DIGEST_AUTH, "ESP","Authentication Failed");
+    }
+
+    // Header
+    content = "<!DOCTYPE HTML>\n"
+              "<html><header>\n"
+              "    <div>\n"
+              "        <a href='https://paulwieland.github.io/ratgdo/'>ratgdo";
+
+    if(strcmp(deviceName.c_str(),"XXX") != 0){
+      content += " - ";
+      content += deviceName;
+    }
+    content += "        </a>"
+               "    </div>\n";
+
+    content += "    <style>\n"
+               "        body{background: #b7b7b7; margin:0; padding:0; font-family:'Open Sans',sans-serif}\n"
+               "        ::-webkit-input-placeholder{color: #34445d;}\n"
+               "        .buttonSubmit {border-radius: 0.5rem !important;} label {font-size: 2rem; color: #34445d;display: inline-block;margin-top: 20px;}\n"
+               "        header,footer{background: #808080; width:100%; text-align:center}  header{padding-top:20px}  footer{padding-bottom:20px}\n"
+               "        header>div,footer>div{background: #465b7c; color:#FFF; width:90%; margin:0  auto; padding:22px; box-sizing:border-box}\n"
+               "        header>div>a{font-size:2rem; color:#FFF; text-decoration:none}\n"
+               "        .form{background:#fff; width:90%; margin:0 auto; padding:20px; box-sizing:border-box}\n"
+               "        .form input{font-size:1.5rem; display:block; width:100%; border:none; border-bottom:solid 1px #ccc; color: #34445d; padding:10px 10px 10px 0; box-sizing:border-box; outline:none; font-family:'Open Sans',sans-serif;}\n"
+               "        hr {display:block; background: #34445d; height:3px; margin:0 auto; margin-top:-2px; width:0px; transition:width  .3s cubic-bezier(0.4,0,0.2,1)}\n"
+               "        .form input:focus + span.line{width:100%}\n"
+               "        .form input[type='checkbox']{\n"
+               "          width: 2rem;\n"
+               "          transform: scale(2.5);\n"
+               "          float: left;\n"
+               "          margin: 1.8rem;\n"
+               "        }\n"
+               "        #send{width:85%; margin:0 auto; margin-top:30px; background: #34445d; border-bottom:none; color:#fff; cursor:pointer}\n"
+               "        .social i{height:40px; width:40px; border-radius:40px; text-align:center; line-height:40px; color:#fff}\n"
+               "       .pwd{display:block; color:#FFF; text-decoration:none; width:280px; margin:20px auto; padding:10px 0}\n"
+               "        @media(max-width:100%){header>div,footer>div,.form{width:90%} header>div>a{font-size:1.5rem; padding:0.5rem 0; display:block}}\n"
+               "        #wifi {font-family: 'Trebuchet MS', Arial, Helvetica, sans-serif;border-collapse: collapse;width: 100%;}#wifi td, #wifi th {border: 1px solid #ddd;padding: 0.5rem;}#wifi tr:nth-child(even){background-color: #f2f2f2;}#wifi tr:hover {background-color: #ddd;}#wifi th {padding-top: 0.6rem;padding-bottom: 0.6rem;text-align: left; background-color: #bbb;color: white;}\n"
+               "    </style>\n"
+               "</header>\n";
+
+    /////////////////////////////////////////////////////
+    // Form
+    content += "<div class='form'>\n";
+    content += htmlString;
+    content += "    <form method='get' action='setting' id='form1'>\n";
+
+    // Form - Device and Config Username
+    content += "        <label for='deviceName'>Device Name &amp; Web Config Username *</label><br/><p style='clear: both'>Use a unique name</p><input type='text' id='deviceName' name='deviceName' maxlength='25' value='";
+    content += deviceName;
+    content += "' required>\n";
+
+    // Form - Device and Config Username Password
+    content += "        <label for='OTApass'>OTA &amp; Web Config Password*</label><input type='password' id='OTApass' name='OTApass' value='";
+    content += OTApass;
+    content += "' required>\n";
+
+    // Form - IP Address
+    content += "        <label for='microcontrollerIP'>IP address</label><input type='text' id='microcontrollerIP' name='microcontrollerIP' value='";
+    content += microcontrollerIP;
+    content += "'>\n";
+
+    // Form - SSID
+    content += "        <label for='ssid'>SSID *</label><input type='text' id='ssid' name='ssid' value='";
+    content += qsid;
+    content += "' required>";
+
+    // Form - WiFi Password
+    content += "        <label for='pass'>WiFi password *</label><input type='password' id='pass' name='pass' value='";
+    content += qpass;
+    content += "' required>\n";
+
+    // Form - Enable MQTT
+    content += "        <label for='mqttCheckbox'>Enable MQTT</label><input type='checkbox' id='mqttCheckbox' name='mqttCheckbox' checked>\n"
+               "        <hr style=\"clear: both\" />\n";
+
+    // Form - MQTT Server Address
+    content += "            <div id='mqttclass'><label id='labelMqttIp' for='mqttIP'>MQTT server IP *</label><input id='inputMqttIp' type='text' id='mqttIP' name='mqttIP' value='";
+    content += mqttIP;
+    content += "' required>\n";
+
+    // Form - MQTT Server Port
+    content += "        <label for='mqttPort'>MQTT server port *</label><input type='text' id='mqttPort' name='mqttPort' value='";
+    content += mqttPort;
+    content += "' required>\n";
+
+    // Form - MQTT Server Username
+    content += "        <label for='mqttuser'>MQTT server username</label><input type='text' id='mqttuser' name='mqttuser' value='";
+    content += mqttuser;
+    content += "'>\n";
+
+    // Form - MQTT Server Username Password
+    content += "        <label for='mqttpass'>MQTT server password</label><input type='password' id='mqttpass' name='mqttpass' value='";
+    content += mqttpass;
+    content += "'>\n";
+
+    // Form - MQTT Topic Prefix
+    content += "        <label for='mqttTopicPrefix'>MQTT Topic Prefix</label><input type='text' id='mqttTopicPrefix' name='mqttTopicPrefix' value='";
+    content += mqttTopicPrefix;
+    content += "'>\n";
+
+    // Form - Home Assistant Discovery Prefix
+    content += "        <label for='haDiscoveryPrefix'>Home Assistant Discovery Prefix</label><p style='clear: both'>Set to `homeassistant` unless you changed your HA configuration to something else.</p><input type='text' id='haDiscoveryPrefix' name='haDiscoveryPrefix' value='";
+    content += haDiscoveryPrefix;
+    content += "'></div>\n";
+
+    // Form - Disable OTA and Webserver Config Access
+    content += "        <label for='disableOTA'>Disable OTA & Webserver Config Access</label><input type='checkbox' id='disableOTA' name='disableOTA'>"
+               "<p style='clear: both'>If you disable OTA a reflash will be required to change the settings.</p>"
+               "\n<hr style='clear: both;'/>";
+
+    // Form - Control Protocol
+    content += "<label for='controlProtocol'>Garage Door Control Protocol</label><br/>"
+               "<select id='controlProtocol' name='controlProtocol'>";
+
+    // Form - Control Protocol - secplus2
+    content += "   <option value='secplus2 '";
+    if( controlProtocol.equals("secplus2"))
+        content += "selected='selected'";
+    content += " >Chamberlain / Liftmaster Security + 2.0</option>";
+
+    // Form - Control Protocol - secplus1
+    content += "   <option value='secplus1' ";
+    if( controlProtocol.equals("secplus1"))
+        content += "selected='selected'";
+    content += " >Chamberlain / Liftmaster Security + 1.0 (beta testing)</option>";
+
+    // Form - Control Protocol - drycontact
+    content += "   <option value='drycontact' ";
+    if( controlProtocol.equals("drycontact"))
+        content += "selected='selected'";
+    content += " >Dry Contacts</option>";
+    content += "</select><p style='clear: both'></p>";
+
+    // End of Form
+    content += "\n"
+               "        <input type='submit' class='buttonSubmit' value='STORE CONFIG' id='send'>\n"
+               "    </form>\n"
+               "</div>\n";
+
+    // Footer
+    content += "<footer>\n"
+               "    <div class='social'>* If you disable OTA you will need to reflash to make changes.</div>\n"
+               "    <a class='pwd' href='https://github.com/paulwieland/ratgdo'>GitHub</a>\n"
+               "</footer>";
+
+    // Script to control MQTT fields when enabled or disabled
+    content += "<script>\n"
+               "    const cb = document.getElementById('mqttCheckbox');\n"
+               "    const x = document.getElementById('mqttclass');\n"
+               "    console.log(cb.checked);\n"
+               "    cb.onclick = () => {\n"
+               "        if (cb.checked) {\n"
+               "            x.style.display = 'block';\n"
+               "            document.getElementById('inputMqttIp').setAttribute('required','')\n"
+               "            document.getElementById('mqttPort').setAttribute('required','')\n"
+               "        } else {\n"
+               "            x.style.display = 'none';\n"
+               "            document.getElementById('inputMqttIp').removeAttribute('required')\n"
+               "            document.getElementById('mqttPort').removeAttribute('required')\n"
+               "            document.getElementById(\"mqttPort\").value = \"\";"
+               "            document.getElementById(\"mqttuser\").value = \"\";"
+               "            document.getElementById(\"mqttpass\").value = \"\";"
+               "            document.getElementById(\"inputMqttIp\").value = \"\";"
+               "        }\n"
+               "    };"
+               "</script>";
+
+    // End of page
+    content += "</html>";
+
+    server.send(200, "text/html", content);
+  });
+
+  ///////////////////////////////////////////////////////
+  // Save settings page - called from setup page
+  server.on("/setting", []() {
+    if(strcmp(OTApass.c_str(), "XXX") != 0 && strcmp(OTApass.c_str(),"") != 0 && !server.authenticate(deviceName.c_str(),OTApass.c_str())){
+      Serial.println("Request Basic Authentication");
+      return server.requestAuthentication(DIGEST_AUTH, "ESP","Authentication Failed");
+    }
+
+    // Get variables from the form
+    String deviceName = server.arg("deviceName");
+    String microcontrollerIP = server.arg("microcontrollerIP");
+    String qsid = server.arg("ssid");
+    String qpass = server.arg("pass");
+    String mqttCheckbox = server.arg("mqttCheckbox");
+    String mqttIP = server.arg("mqttIP");
+    String mqttPort = server.arg("mqttPort");
+    String OTApass = server.arg("OTApass");
+    String mqttuser = server.arg("mqttuser");
+    String mqttpass = server.arg("mqttpass");
+    String mqttTopicPrefix = server.arg("mqttTopicPrefix");
+    String haDiscoveryPrefix = server.arg("haDiscoveryPrefix");
+    String disableOTA = server.arg("disableOTA");
+    String controlProtocol = server.arg("controlProtocol");
+    String additionalParam = server.arg("additionalParam");
+    DynamicJsonDocument doc(1024);
+
+    // If the required settings are not blank
+    if (deviceName.length() > 0 && qsid.length() > 0 && qpass.length() > 0 && OTApass.length() > 0
+        && ((mqttCheckbox.length() == 0) || (mqttIP.length() > 0 && mqttPort.length() > 0))) {
+
+      // If the IP address is blank, set IP to "DHCP"
+      if (microcontrollerIP.length() == 0) {
+        microcontrollerIP = "DHCP";
+      }
+
+      // Report the settings on the serial port
+      Serial.print("deviceName: ");
+      Serial.println(deviceName);
+      Serial.print("microcontrollerIP: ");
+      Serial.println(microcontrollerIP);
+      Serial.print("qsid: ");
+      Serial.println(qsid);
+      Serial.print("qpass: ");
+      Serial.println(qpass);
+      Serial.print("OTApass: ");
+      Serial.println(OTApass);
+      Serial.print("mqttIP: ");
+      Serial.println(mqttIP);
+      Serial.print("mqttPort: ");
+      Serial.println(mqttPort);
+      Serial.print("mqttuser: ");
+      Serial.println(mqttuser);
+      Serial.print("mqttpass: ");
+      Serial.println(mqttpass);
+      Serial.print("mqttTopicPrefix: ");
+      Serial.println(mqttTopicPrefix);
+      Serial.print("haDiscoveryPrefix: ");
+      Serial.println(haDiscoveryPrefix);
+      Serial.print("controlProtocol: ");
+      Serial.println(controlProtocol);
+      Serial.print("disableOTA: ");
+      Serial.println(disableOTA);
+      Serial.print("additionalParam: ");
+      Serial.println(additionalParam);
+
+      // Fill in the JSON file for the settings
+      doc["deviceName"] = deviceName;
+      doc["microcontrollerIP"] = microcontrollerIP;
+      doc["qsid"] = qsid;
+      doc["qpass"] = qpass;
+      doc["OTApass"] = OTApass;
+
+      if (mqttCheckbox.equals("on")) {
+        doc["mqttIP"] = mqttIP;
+        doc["mqttPort"] = mqttPort;
+        doc["mqttuser"] = mqttuser;
+        doc["mqttpass"] = mqttpass;
+        doc["mqttTopicPrefix"] = mqttTopicPrefix;
+      } else {
+        doc["mqttIP"] = "";
+        doc["mqttPort"] = "";
+        doc["mqttuser"] = "";
+        doc["mqttpass"] = "";
+        doc["mqttTopicPrefix"] = "";
+      }
+
+      doc["haDiscoveryPrefix"] = haDiscoveryPrefix;
+      doc["disableOTA"] = disableOTA.equals("on");
+      doc["controlProtocol"] = controlProtocol;
+      doc["additionalParam"] = additionalParam;
+
+      // Report success
+      content = "Success: rebooting the microcontroller using your credentials.";
+      statusCode = 200;
+    } else {
+      Serial.println("Sending 404");
+
+      // Report failure
+      content = "Error: missing required fields.";
+      statusCode = 404;
+    }
+    delay(DELAY_500);
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(statusCode, "text/plain", content);
+    delay(DELAY_500);
+
+#if defined(ESP8266)
+    // Write to LittleFS
+    Serial.println(F("Saving setup.json"));
+    File jsonFile = LittleFS.open("/setup.json", "w");
+    if (!jsonFile) {
+      Serial.println("Failed to open [setup.json] file for writing");
+    } else {
+      serializeJsonPretty(doc, Serial);
+      serializeJson(doc, jsonFile);
+      jsonFile.close();
+      Serial.println("[setup.json] written correctly");
+    }
+    delay(DELAY_200);
+#elif defined(ESP32)
+    // Write to SPIFFS
+    if (SPIFFS.begin(true)) {
+      delay(DELAY_500);
+      File configFile = SPIFFS.open("/setup.json", "w");
+      if (!configFile) {
+        Serial.println("Failed to open [setup.json] file for writing");
+      } else {
+        serializeJsonPretty(doc, Serial);
+        serializeJson(doc, configFile);
+        configFile.close();
+        Serial.println("[setup.json] written correctly");
+      }
+    } else {
+      Serial.println(F("Failed to mount FS for write"));
+    }
+ #endif
+    delay(DELAY_1000);
+#if defined(ESP8266) || defined(ESP32)
+    // Reboot
+    ESP.restart();
+#endif
+  });
+
+#ifdef DEBUG_LOG
+  ///////////////////////////////////////////////////////
+  // Dump out some debug on the web server
+  server.on("/debug", []() {
+    if(strcmp(OTApass.c_str(), "XXX") != 0 && strcmp(OTApass.c_str(),"") != 0 && !server.authenticate(deviceName.c_str(),OTApass.c_str())){
+      Serial.println("Request Basic Authentication");
+      Serial.print("pass: ");
+      Serial.println(OTApass.c_str());
+      return server.requestAuthentication(DIGEST_AUTH, "ESP","Authentication Failed");
+    }
+
+    content = debugOutput; 
+
+    server.send(200, "text/plain", content);
+  });
+#endif
+}
+
+bool WifiManager::isConnected() {
+
+  return (WiFi.localIP()[0] != 0 && WiFi.status() == WL_CONNECTED);
+
+}
+
+void WifiManager::sendImprovStateResponse(uint8_t state, bool error) {
+
+  if (!error && improvError > 0 && improvError < 3) sendImprovStateResponse(0x00, true);
+  if (error) improvError = state;
+  char out[11] = {'I', 'M', 'P', 'R', 'O', 'V'};
+  out[6] = IMPROV_VERSION;
+  out[7] = error ? ImprovPacketType::Error_State : ImprovPacketType::Current_State;
+  out[8] = 1;
+  out[9] = state;
+  uint8_t checksum = 0;
+  for (uint8_t i = 0; i < 10; i++) checksum += out[i];
+  out[10] = checksum;
+  Serial.write((uint8_t *) out, 11);
+  Serial.write('\n');
+
+}
+
+void WifiManager::sendImprovRPCResponse(byte commandId) {
+
+  sendImprovRPCResponse(commandId, false);
+
+}
+
+void WifiManager::sendImprovRPCResponse(byte commandId, bool forceConnection) {
+
+  if (improvError > 0 && improvError < 3) sendImprovStateResponse(0x00, true);
+  uint8_t packetLen = 12;
+  char out[64] = {'I', 'M', 'P', 'R', 'O', 'V'};
+  out[6] = IMPROV_VERSION;
+  out[7] = ImprovPacketType::RPC_Response;
+  out[8] = 2; //Length (set below)
+  out[9] = commandId;
+  out[10] = 0; //Data len (set below)
+  out[11] = '\0'; //URL len (set below)
+  if (isConnected() || forceConnection) {
+    IPAddress localIP = WiFi.localIP();
+    uint8_t len = sprintf(out + 12, "http://%d.%d.%d.%d", localIP[0], localIP[1], localIP[2], localIP[3]);
+    if (len > 24) return; //sprintf fail
+    out[11] = len;
+    out[10] = 1 + len;
+    out[8] = 3 + len; //RPC command type + data len + url len + url
+    packetLen = 13 + len;
+  }
+  uint8_t checksum = 0;
+  for (uint8_t i = 0; i < packetLen - 1; i++) checksum += out[i];
+  out[packetLen - 1] = checksum;
+  Serial.write((uint8_t *) out, packetLen);
+  Serial.write('\n');
+  improvActive = 1; //no longer provisioning
+
+}
+
+void WifiManager::sendImprovInfoResponse() {
+
+  if (improvError > 0 && improvError < 3) sendImprovStateResponse(0x00, true);
+  uint8_t packetLen = 12;
+  char out[128] = {'I', 'M', 'P', 'R', 'O', 'V'};
+  out[6] = IMPROV_VERSION;
+  out[7] = ImprovPacketType::RPC_Response;
+  //out[8] = 2; //Length (set below)
+  out[9] = ImprovRPCType::Request_Info;
+  //out[10] = 0; //Data len (set below)
+  out[11] = 4; //Firmware len ("FIRM")
+  out[12] = 'F';
+  out[13] = 'I';
+  out[14] = 'R';
+  out[15] = 'M';
+  uint8_t lengthSum = 17;
+  uint8_t vlen = sprintf_P(out + lengthSum, firmwareVersion.c_str());
+  out[16] = vlen;
+  lengthSum += vlen;
+  uint8_t hlen = 7;
+#ifdef ESP8266
+  strcpy(out + lengthSum + 1, "esp8266");
+#else
+  hlen = 5;
+  strcpy(out+lengthSum+1,"esp32");
+#endif
+  out[lengthSum] = hlen;
+  lengthSum += hlen + 1;
+  //Use serverDescription if it has been changed from the default "FIRM", else mDNS name
+  bool useMdnsName = (strcmp(serverDescription, "FIRM") == 0 && strlen(cmDNS) > 0);
+  strcpy(out + lengthSum + 1, useMdnsName ? cmDNS : serverDescription);
+  uint8_t nlen = strlen(useMdnsName ? cmDNS : serverDescription);
+  out[lengthSum] = nlen;
+  lengthSum += nlen + 1;
+  packetLen = lengthSum + 1;
+  out[8] = lengthSum - 9;
+  out[10] = lengthSum - 11;
+  uint8_t checksum = 0;
+  for (uint8_t i = 0; i < packetLen - 1; i++) checksum += out[i];
+  out[packetLen - 1] = checksum;
+  Serial.write((uint8_t *) out, packetLen);
+  Serial.write('\n');
+  DIMPROV_PRINT("Info checksum");
+  DIMPROV_PRINTLN(checksum);
+
+}
+
+void WifiManager::parseWiFiCommand(char *rpcData) {
+
+  uint8_t len = rpcData[0];
+  if (!len || len > 126) return;
+  uint8_t ssidLen = rpcData[1];
+  if (ssidLen > len - 1 || ssidLen > 32) return;
+  memset(clientSSID, 0, 32);
+  memcpy(clientSSID, rpcData + 2, ssidLen);
+  memset(clientPass, 0, 64);
+  if (len > ssidLen + 1) {
+    uint8_t passLen = rpcData[2 + ssidLen];
+    memset(clientPass, 0, 64);
+    memcpy(clientPass, rpcData + 3 + ssidLen, passLen);
+  }
+  sendImprovStateResponse(0x03, false); //provisioning
+  improvActive = 2;
+  DynamicJsonDocument doc(1024);
+  String devName = String(random(0, 90000));
+  doc["deviceName"] = String(DEVICE_NAME) + "_" + devName;
+  doc["microcontrollerIP"] = "DHCP";
+  doc["qsid"] = clientSSID;
+  doc["qpass"] = clientPass;
+  doc["OTApass"] = "";
+  doc["mqttIP"] = "";
+  doc["mqttPort"] = "";
+  doc["mqttuser"] = "";
+  doc["mqttpass"] = "";
+  doc["mqttTopicPrefix"] = "";
+  doc["haDiscoveryPrefix"] = HA_DISCOVERY_PREFIX;
+  
+  additionalParam = "2";
+#ifdef ESP32
+  if (SPIFFS.begin(true)) {
+    delay(DELAY_500);
+    File configFile = SPIFFS.open("/setup.json", "w");
+    if (!configFile) {
+      Serial.println("Failed to open [setup.json] file for writing");
+    } else {
+      serializeJsonPretty(doc, Serial);
+      serializeJson(doc, configFile);
+      configFile.close();
+    }
+  } else {
+    Serial.println(F("Failed to mount FS for write"));
+  }
+#else
+  Serial.println(F("Saving setup.json"));
+  File jsonFile = LittleFS.open("/setup.json", "w");
+  if (!jsonFile) {
+    Serial.println("Failed to open [setup.json] file for writing");
+  } else {
+    serializeJsonPretty(doc, Serial);
+    serializeJson(doc, jsonFile);
+    jsonFile.close();
+  }
+  delay(DELAY_200);
+#endif
+  sendImprovRPCResponse(ImprovRPCType::Request_State);
+  delay(DELAY_200);
+  sendImprovStateResponse(0x04, false);
+  delay(DELAY_200);
+  ESP.restart();
+
+}
+
+//blocking function to parse an Improv Serial packet
+void WifiManager::handleImprovPacket() {
+
+  uint8_t header[6] = {'I', 'M', 'P', 'R', 'O', 'V'};
+  bool timeout = false;
+  uint16_t packetByte = 0;
+  uint8_t packetLen = 9;
+  uint8_t checksum = 0;
+  uint8_t waitTime = 25;
+  uint8_t rpcCommandType = 0;
+  char rpcData[128];
+  rpcData[0] = 0;
+  while (!timeout) {
+    if (Serial.available() < 1) {
+      delay(1);
+      waitTime--;
+      if (!waitTime) timeout = true;
+      continue;
+    }
+    byte next = Serial.read();
+    DIMPROV_PRINT("Received improv byte: "); DIMPROV_PRINTF("%x\r\n", next);
+    switch (packetByte) {
+      case ImprovPacketByte::Version: {
+        if (next != IMPROV_VERSION) {
+          DIMPROV_PRINTLN(F("Invalid version"));
+          return;
+        }
+        break;
+      }
+      case ImprovPacketByte::PacketType: {
+        if (next != ImprovPacketType::RPC_Command) {
+          DIMPROV_PRINTF("Non RPC-command improv packet type %i\n", next);
+          return;
+        }
+        if (!improvActive) {
+          improvActive = 1;
+          improvePacketReceived = true;
+        }
+        break;
+      }
+      case ImprovPacketByte::Length:
+        packetLen = 9 + next;
+        break;
+      case ImprovPacketByte::RPC_CommandType:
+        rpcCommandType = next;
+        break;
+      default: {
+        if (packetByte >= packetLen) { //end of packet, check checksum match
+          if (checksum != next) {
+            DIMPROV_PRINTF("Got RPC checksum %i, expected %i", next, checksum);
+            sendImprovStateResponse(0x01, true);
+            return;
+          }
+          switch (rpcCommandType) {
+            case ImprovRPCType::Command_Wifi:
+              parseWiFiCommand(rpcData);
+              break;
+            case ImprovRPCType::Request_State: {
+              uint8_t improvState = 0x02; //authorized
+              if (isWifiConfigured()) improvState = 0x03; //provisioning
+              if (WiFi.localIP()[0] != 0 && WiFi.status() == WL_CONNECTED) improvState = 0x04; //provisioned
+              sendImprovStateResponse(improvState, false);
+              if (improvState == 0x04) sendImprovRPCResponse(ImprovRPCType::Request_State);
+              break;
+            }
+            case ImprovRPCType::Request_Info:
+              sendImprovInfoResponse();
+              break;
+            default: {
+              DIMPROV_PRINTF("Unknown RPC command %i\n", next);
+              sendImprovStateResponse(0x02, true);
+            }
+          }
+          return;
+        }
+        if (packetByte < 6) { //check header
+          if (next != header[packetByte]) {
+            DIMPROV_PRINTLN(F("Invalid improv header"));
+            return;
+          }
+        } else if (packetByte > 9) { //RPC data
+          rpcData[packetByte - 10] = next;
+          if (packetByte > 137) return; //prevent buffer overflow
+        }
+      }
+    }
+    checksum += next;
+    packetByte++;
+  }
+
+}
+
+

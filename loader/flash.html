@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<script src="jquery-3.6.0.min.js"></script>
+		<script
+		  type="module"
+		  src="https://unpkg.com/esp-web-tools@9.0.5/dist/web/install-button.js?module"
+		></script>
+		<style type="text/css">
+			* {
+				font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+			}
+			h1{
+				margin-bottom: 5px;
+			}
+			h3{
+				margin-bottom: 5px;
+			}
+			p {
+				margin-top: 0px;
+			}
+		</style>	
+	</head>
+<body>
+	<img src="images/ratgdo.png" alt="ratgdo" style="float: left; width: 100px; border-radius: 4px;" />
+	<div style="padding-left: 105px; margin-bottom: 15px">
+		<h1>ratgdo Firmware</h1>
+	</div>
+
+	<hr style="clear:both;" />
+
+	<img src="images/mqtt_logo.png" alt="HomeKit" style="float: left; width: 75px; clear: left;" />
+	<div style="padding-left: 80px; margin-bottom: 15px">
+		<h3>MQTT</h3>
+		<p>If you already have an MQTT broker and like messaging APIs, then install the MQTT firmware:</p>
+		<label for="selectManifest">Choose version:</label>
+		<select id="selectManifest" onchange="setManifest()">
+			<option value="" selected>Please Choose Firmware Version:</option>
+			<optgroup label="Black v2.5x Boards Only">
+				<option value="flasher/manifest_v25.json">ratgdo v2.59, Security + 1.0, 2.0 & Dry Contact</option>
+			</optgroup>
+		</select>
+		<esp-web-install-button manifest="" id="manifest"></esp-web-install-button>
+	
+	</div>
+
+	<hr style="clear:both" />
+
+	<script>
+		var manifest = $("#manifest").attr("manifest",`flasher/manifest.json`);
+
+		function setManifest(){
+			if($("#selectManifest").val() === ""){
+				alert("Please choose a firmware from the drop down.");
+				$("esp-web-install-button").hide();
+			}else{
+				$("esp-web-install-button").show();
+			}
+
+			$("#manifest").attr("manifest",$("#selectManifest").val());
+		}
+
+		$("esp-web-install-button").hide();
+	</script>
+</body>
+</html>
+
